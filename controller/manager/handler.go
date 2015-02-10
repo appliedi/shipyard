@@ -1,9 +1,7 @@
 package manager
 
 import (
-	"time"
-
-	"github.com/citadel/citadel"
+	"github.com/samalba/dockerclient"
 	"github.com/shipyard/shipyard"
 )
 
@@ -13,18 +11,17 @@ type (
 	}
 )
 
-func (h *EventHandler) Handle(e *citadel.Event) error {
-	logger.Infof("event: date=%s type=%s image=%s container=%s", e.Time.Format(time.RubyDate), e.Type, e.Container.Image.Name, e.Container.ID[:12])
+func (h *EventHandler) Handle(e *dockerclient.Event) error {
+	logger.Infof("event: date=%d status=%s container=%s", e.Time, e.Status, e.Id[:12])
 	h.logDockerEvent(e)
 	return nil
 }
 
-func (h *EventHandler) logDockerEvent(e *citadel.Event) error {
+func (h *EventHandler) logDockerEvent(e *dockerclient.Event) error {
 	evt := &shipyard.Event{
-		Type:      e.Type,
+		Type:      e.Status,
 		Time:      e.Time,
-		Container: e.Container,
-		Engine:    e.Engine,
+		Container: e.Id,
 		Tags:      []string{"docker"},
 	}
 	if err := h.Manager.SaveEvent(evt); err != nil {

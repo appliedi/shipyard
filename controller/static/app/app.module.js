@@ -7,7 +7,6 @@
         'shipyard.layout',
         'shipyard.shared',
         'shipyard.dashboard',
-        'shipyard.engines',
         'shipyard.containers',
         'shipyard.events',
         'shipyard.filters',

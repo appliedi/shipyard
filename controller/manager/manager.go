@@ -14,13 +14,12 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/citadel/citadel"
-	"github.com/citadel/citadel/cluster"
-	"github.com/citadel/citadel/scheduler"
 	r "github.com/dancannon/gorethink"
 	"github.com/gorilla/sessions"
 	"github.com/shipyard/shipyard"
 	"github.com/shipyard/shipyard/dockerhub"
+
+	"github.com/samalba/dockerclient"
 )
 
 const (
@@ -55,17 +54,16 @@ type (
 		database         string
 		authKey          string
 		session          *r.Session
-		clusterManager   *cluster.Cluster
-		engines          []*shipyard.Engine
 		authenticator    *shipyard.Authenticator
 		store            *sessions.CookieStore
-		StoreKey         string
 		version          string
 		disableUsageInfo bool
+		client           *dockerclient.DockerClient
+		StoreKey         string
 	}
 )
 
-func NewManager(addr string, database string, authKey string, version string, disableUsageInfo bool) (*Manager, error) {
+func NewManager(addr string, database string, authKey string, version string, swarmUrl string, tlsConfig *tls.Config, disableUsageInfo bool) (*Manager, error) {
 	session, err := r.Connect(r.ConnectOpts{
 		Address:     addr,
 		Database:    database,
@@ -78,6 +76,8 @@ func NewManager(addr string, database string, authKey string, version string, di
 	}
 	logger.Info("checking database")
 	r.DbCreate(database).Run(session)
+
+	client, err := dockerclient.NewDockerClient(swarmUrl, tlsConfig)
 	m := &Manager{
 		address:          addr,
 		database:         database,
@@ -85,17 +85,14 @@ func NewManager(addr string, database string, authKey string, version string, di
 		session:          session,
 		authenticator:    &shipyard.Authenticator{},
 		store:            store,
-		StoreKey:         storeKey,
 		version:          version,
 		disableUsageInfo: disableUsageInfo,
+		StoreKey:         storeKey,
+		client:           client,
 	}
 	m.initdb()
 	m.init()
 	return m, nil
-}
-
-func (m *Manager) ClusterManager() *cluster.Cluster {
-	return m.clusterManager
 }
 
 func (m *Manager) Store() *sessions.CookieStore {
@@ -115,65 +112,9 @@ func (m *Manager) initdb() {
 	}
 }
 
-func (m *Manager) init() []*shipyard.Engine {
-	engines := []*shipyard.Engine{}
-	res, err := r.Table(tblNameConfig).Run(m.session)
-	if err != nil {
-		logger.Fatalf("error getting configuration: %s", err)
-	}
-	if err := res.All(&engines); err != nil {
-		logger.Fatalf("error loading configuration: %s", err)
-	}
-	m.engines = engines
-	var engs []*citadel.Engine
-	for _, d := range engines {
-		tlsConfig := &tls.Config{}
-		if d.CACertificate != "" && d.SSLCertificate != "" && d.SSLKey != "" {
-			caCert := []byte(d.CACertificate)
-			sslCert := []byte(d.SSLCertificate)
-			sslKey := []byte(d.SSLKey)
-			c, err := getTLSConfig(caCert, sslCert, sslKey)
-			if err != nil {
-				logger.Errorf("error getting tls config: %s", err)
-			}
-			tlsConfig = c
-		}
-		if err := setEngineClient(d.Engine, tlsConfig); err != nil {
-			logger.Errorf("error setting tls config for engine: %s", err)
-		}
-		engs = append(engs, d.Engine)
-		logger.Infof("loaded engine id=%s addr=%s", d.Engine.ID, d.Engine.Addr)
-	}
-	clusterManager, err := cluster.New(scheduler.NewResourceManager(), engs...)
-	if err != nil {
-		logger.Fatal(err)
-	}
-	if err := clusterManager.Events(&EventHandler{Manager: m}); err != nil {
-		logger.Fatalf("unable to register event handler: %s", err)
-	}
-	var (
-		labelScheduler  = &scheduler.LabelScheduler{}
-		uniqueScheduler = &scheduler.UniqueScheduler{}
-		hostScheduler   = &scheduler.HostScheduler{}
-
-		multiScheduler = scheduler.NewMultiScheduler(
-			labelScheduler,
-			uniqueScheduler,
-		)
-	)
-	// TODO: refactor to be configurable
-	clusterManager.RegisterScheduler("service", labelScheduler)
-	clusterManager.RegisterScheduler("unique", uniqueScheduler)
-	clusterManager.RegisterScheduler("multi", multiScheduler)
-	clusterManager.RegisterScheduler("host", hostScheduler)
-	m.clusterManager = clusterManager
-	// start extension health check
-	go m.extensionHealthCheck()
-	// start engine check
-	go m.engineCheck()
+func (m *Manager) init() {
 	// anonymous usage info
 	go m.usageReport()
-	return engines
 }
 
 func (m *Manager) usageReport() {
@@ -202,15 +143,18 @@ func (m *Manager) uploadUsage() {
 			}
 		}
 	}
-	info := m.clusterManager.ClusterInfo()
+	info, err := m.client.Info()
+	if err != nil {
+		logger.Warnf("error getting info: %s", err)
+		return
+	}
 	usage := &shipyard.Usage{
 		ID:              id,
 		Version:         m.version,
-		NumOfEngines:    info.EngineCount,
-		NumOfImages:     info.ImageCount,
-		NumOfContainers: info.ContainerCount,
-		TotalCpus:       info.Cpus,
-		TotalMemory:     info.Memory,
+		NumOfImages:     info.Images,
+		NumOfContainers: info.Containers,
+		TotalCpus:       info.NCPU,
+		TotalMemory:     info.MemTotal,
 	}
 	b, err := json.Marshal(usage)
 	if err != nil {
@@ -222,228 +166,93 @@ func (m *Manager) uploadUsage() {
 	}
 }
 
-func (m *Manager) extensionHealthCheck() {
-	t := time.NewTicker(time.Second * 1).C
-	for {
-		select {
-		case <-t:
-			exts, err := m.Extensions()
-			if err != nil {
-				logger.Warnf("error running extension health check: %s", err)
-				return
-			}
-			for _, ext := range exts {
-				var once sync.Once
-				once.Do(func() { m.checkExtensionHealth(ext) })
-			}
-		}
-	}
-}
-
-func (m *Manager) checkExtensionHealth(ext *shipyard.Extension) error {
-	containers := m.Containers(true)
-	engs := m.Engines()
-	engines := []*citadel.Engine{}
-	for _, eng := range engs {
-		engines = append(engines, eng.Engine)
-	}
-	extEngines := []*citadel.Engine{}
-	for _, c := range containers {
-		if val, ok := c.Image.Environment["_SHIPYARD_EXTENSION"]; ok {
-			// check if the same parent extension
-			if val == ext.ID {
-				extEngines = append(extEngines, c.Engine)
-			}
-		}
-	}
-	if len(extEngines) == 0 || ext.Config.DeployPerEngine && len(extEngines) < len(engines) {
-		logger.Infof("recovering extension %s", ext.Name)
-		// extension is missing a container; deploy
-		if err := m.RegisterExtension(ext); err != nil {
-			logger.Warnf("error recovering extension: %s", err)
-		}
-	}
-	return nil
-}
-
-func (m *Manager) engineCheck() {
-	t := time.NewTicker(time.Second * 10).C
-	for {
-		select {
-		case <-t:
-			engs := m.Engines()
-			for _, eng := range engs {
-				health := &shipyard.Health{}
-				start_time := time.Now()
-				stat, err := eng.Ping()
-				if err != nil {
-					logger.Warnf("unable to ping engine: %s", err)
-				}
-				if stat != 200 {
-					health.Status = EngineHealthDown
-				} else {
-					health.Status = EngineHealthUp
-					health.ResponseTime = int64(time.Since(start_time) / time.Nanosecond)
-				}
-				eng.Health = health
-				// get version
-				version, err := eng.Engine.Version()
-				if err != nil {
-					logger.Warnf("unable to detect docker version: %s", err)
-				}
-				ver := ""
-				if version != nil {
-					ver = version.Version
-				}
-				eng.DockerVersion = ver
-				m.SaveEngine(eng)
-			}
-		}
-	}
-}
-
-func (m *Manager) Engines() []*shipyard.Engine {
-	return m.engines
-}
-
-func (m *Manager) Engine(id string) *shipyard.Engine {
-	for _, e := range m.engines {
-		if e.ID == id {
-			return e
-		}
-	}
-	return nil
-}
-
-func (m *Manager) AddEngine(engine *shipyard.Engine) error {
-	stat, err := engine.Ping()
+func (m *Manager) Container(id string) (*dockerclient.ContainerInfo, error) {
+	containers, err := m.client.ListContainers(true, false, "")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if stat != 200 {
-		err := fmt.Errorf("Received status code '%d' when contacting %s", stat, engine.Engine.Addr)
-		return err
-	}
-	if _, err := r.Table(tblNameConfig).Insert(engine).RunWrite(m.session); err != nil {
-		return err
-	}
-	m.init()
-	evt := &shipyard.Event{
-		Type:   "add-engine",
-		Time:   time.Now(),
-		Engine: engine.Engine,
-		Tags:   []string{"cluster"},
-	}
-	if err := m.SaveEvent(evt); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m *Manager) SaveEngine(engine *shipyard.Engine) error {
-	if _, err := r.Table(tblNameConfig).Replace(engine).RunWrite(m.session); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m *Manager) RemoveEngine(id string) error {
-	var engine *shipyard.Engine
-	res, err := r.Table(tblNameConfig).Filter(map[string]string{"id": id}).Run(m.session)
-	if err != nil {
-		return err
-	}
-	if err := res.One(&engine); err != nil {
-		if err == r.ErrEmptyResult {
-			return nil
-		}
-		return err
-	}
-	evt := &shipyard.Event{
-		Type:   "remove-engine",
-		Time:   time.Now(),
-		Engine: engine.Engine,
-		Tags:   []string{"cluster"},
-	}
-	if err := m.SaveEvent(evt); err != nil {
-		return err
-	}
-	if _, err := r.Table(tblNameConfig).Get(id).Delete().RunWrite(m.session); err != nil {
-		return err
-	}
-	m.init()
-	return nil
-}
-
-func (m *Manager) Container(id string) (*citadel.Container, error) {
-	containers := m.clusterManager.ListContainers(true, false, "")
 	for _, cnt := range containers {
-		if strings.HasPrefix(cnt.ID, id) {
-			return cnt, nil
+		if strings.HasPrefix(cnt.Id, id) {
+			info, err := m.client.InspectContainer(cnt.Id)
+			if err != nil {
+				return nil, err
+			}
+			return info, nil
 		}
 	}
 	return nil, nil
 }
 
-func (m *Manager) Logs(container *citadel.Container, stdout bool, stderr bool) (io.ReadCloser, error) {
-	data, err := m.clusterManager.Logs(container, stdout, stderr)
+func (m *Manager) Logs(id string, options *dockerclient.LogOptions) (io.ReadCloser, error) {
+	return m.client.ContainerLogs(id, options)
+}
+
+func (m *Manager) Restart(id string) error {
+	return m.client.RestartContainer(id, 10)
+}
+
+func (m *Manager) Containers(all bool) ([]dockerclient.Container, error) {
+	return m.client.ListContainers(all, false, "")
+}
+
+func (m *Manager) ContainersByImage(name string, all bool) ([]*dockerclient.ContainerInfo, error) {
+	allContainers, err := m.Containers(all)
 	if err != nil {
 		return nil, err
 	}
-	return data, nil
-}
-
-func (m *Manager) Containers(all bool) []*citadel.Container {
-	return m.clusterManager.ListContainers(all, false, "")
-}
-
-func (m *Manager) ContainersByImage(name string, all bool) ([]*citadel.Container, error) {
-	allContainers := m.Containers(all)
-	imageContainers := []*citadel.Container{}
+	imageContainers := []*dockerclient.ContainerInfo{}
 	for _, c := range allContainers {
-		if strings.Index(c.Image.Name, name) > -1 {
-			imageContainers = append(imageContainers, c)
+		if strings.Index(c.Image, name) > -1 {
+			info, err := m.client.InspectContainer(c.Id)
+			if err != nil {
+				return nil, err
+			}
+			imageContainers = append(imageContainers, info)
 		}
 	}
 	return imageContainers, nil
 }
 
-func (m *Manager) IdenticalContainers(container *citadel.Container, all bool) ([]*citadel.Container, error) {
-	containers := []*citadel.Container{}
-	imageContainers, err := m.ContainersByImage(container.Image.Name, all)
+func (m *Manager) IdenticalContainers(container *dockerclient.ContainerInfo, all bool) ([]*dockerclient.ContainerInfo, error) {
+	containers := []*dockerclient.ContainerInfo{}
+	imageContainers, err := m.ContainersByImage(container.Image, all)
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range imageContainers {
-		args := len(c.Image.Args)
-		origArgs := len(container.Image.Args)
-		if c.Image.Memory == container.Image.Memory && args == origArgs && c.Image.Type == container.Image.Type {
+		args := len(c.Args)
+		origArgs := len(container.Args)
+		if c.Config.Memory == container.Config.Memory && args == origArgs {
 			containers = append(containers, c)
 		}
 	}
 	return containers, nil
 }
 
-func (m *Manager) ClusterInfo() *shipyard.ClusterInfo {
-	info := m.clusterManager.ClusterInfo()
+func (m *Manager) ClusterInfo() (*shipyard.ClusterInfo, error) {
+	info, err := m.client.Info()
+	if err != nil {
+		return nil, err
+	}
 	clusterInfo := &shipyard.ClusterInfo{
-		Cpus:           info.Cpus,
-		Memory:         info.Memory,
-		ContainerCount: info.ContainerCount,
-		EngineCount:    info.EngineCount,
-		ImageCount:     info.ImageCount,
-		ReservedCpus:   info.ReservedCpus,
-		ReservedMemory: info.ReservedMemory,
+		Cpus:           info.NCPU,
+		Memory:         info.MemTotal,
+		ContainerCount: info.Containers,
+		ImageCount:     info.Images,
 		Version:        m.version,
 	}
-	return clusterInfo
+	return clusterInfo, nil
 }
 
-func (m *Manager) Destroy(container *citadel.Container) error {
-	if err := m.ClusterManager().Kill(container, 9); err != nil {
+func (m *Manager) Stop(id string) error {
+	return m.client.StopContainer(id, 10)
+}
+
+func (m *Manager) Destroy(id string) error {
+	if err := m.client.KillContainer(id, "kill"); err != nil {
 		return err
 	}
-	if err := m.ClusterManager().Remove(container); err != nil {
+	if err := m.client.RemoveContainer(id, true); err != nil {
 		return err
 	}
 	return nil
@@ -456,7 +265,7 @@ func (m *Manager) SaveServiceKey(key *shipyard.ServiceKey) error {
 	m.init()
 	evt := &shipyard.Event{
 		Type:    "add-service-key",
-		Time:    time.Now(),
+		Time:    time.Now().Unix(),
 		Message: fmt.Sprintf("description=%s", key.Description),
 		Tags:    []string{"cluster", "security"},
 	}
@@ -473,7 +282,7 @@ func (m *Manager) RemoveServiceKey(key string) error {
 	}
 	evt := &shipyard.Event{
 		Type:    "remove-service-key",
-		Time:    time.Now(),
+		Time:    time.Now().Unix(),
 		Message: fmt.Sprintf("description=%s", k.Description),
 		Tags:    []string{"cluster", "security"},
 	}
@@ -595,7 +404,7 @@ func (m *Manager) SaveAccount(account *shipyard.Account) error {
 	}
 	evt := &shipyard.Event{
 		Type:    "add-account",
-		Time:    time.Now(),
+		Time:    time.Now().Unix(),
 		Message: fmt.Sprintf("name=%s", account.Username),
 		Tags:    []string{"cluster", "security"},
 	}
@@ -615,7 +424,7 @@ func (m *Manager) DeleteAccount(account *shipyard.Account) error {
 	}
 	evt := &shipyard.Event{
 		Type:    "delete-account",
-		Time:    time.Now(),
+		Time:    time.Now().Unix(),
 		Message: fmt.Sprintf("name=%s", account.Username),
 		Tags:    []string{"cluster", "security"},
 	}
@@ -659,7 +468,7 @@ func (m *Manager) SaveRole(role *shipyard.Role) error {
 	}
 	evt := &shipyard.Event{
 		Type:    "add-role",
-		Time:    time.Now(),
+		Time:    time.Now().Unix(),
 		Message: fmt.Sprintf("name=%s", role.Name),
 		Tags:    []string{"cluster", "security"},
 	}
@@ -679,7 +488,7 @@ func (m *Manager) DeleteRole(role *shipyard.Role) error {
 	}
 	evt := &shipyard.Event{
 		Type:    "delete-role",
-		Time:    time.Now(),
+		Time:    time.Now().Unix(),
 		Message: fmt.Sprintf("name=%s", role.Name),
 		Tags:    []string{"cluster", "security"},
 	}
@@ -790,191 +599,43 @@ func (m *Manager) ChangePassword(username, password string) error {
 	return nil
 }
 
-func (m *Manager) Extensions() ([]*shipyard.Extension, error) {
-	res, err := r.Table(tblNameExtensions).OrderBy(r.Asc("name")).Run(m.session)
-	if err != nil {
-		return nil, err
-	}
-	exts := []*shipyard.Extension{}
-	if err := res.All(&exts); err != nil {
-		return nil, err
-	}
-	return exts, nil
-}
-
-func (m *Manager) Extension(id string) (*shipyard.Extension, error) {
-	res, err := r.Table(tblNameExtensions).Get(id).Run(m.session)
-	if err != nil {
-		return nil, err
-
-	}
-	if res.IsNil() {
-		return nil, ErrExtensionDoesNotExist
-	}
-	var ext *shipyard.Extension
-	if err := res.One(&ext); err != nil {
-		return nil, err
-	}
-	return ext, nil
-}
-
-func (m *Manager) SaveExtension(ext *shipyard.Extension) error {
-	res, err := r.Table(tblNameExtensions).Insert(ext).RunWrite(m.session)
-	if err != nil {
-		return err
-	}
-	evt := &shipyard.Event{
-		Type:    "add-extension",
-		Time:    time.Now(),
-		Message: fmt.Sprintf("name=%s version=%s author=%s", ext.Name, ext.Version, ext.Author),
-		Tags:    []string{"cluster"},
-	}
-	if err := m.SaveEvent(evt); err != nil {
-		return err
-	}
-	key := res.GeneratedKeys[0]
-	ext.ID = key
-	// register
-	if err := m.RegisterExtension(ext); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m *Manager) RegisterExtension(ext *shipyard.Extension) error {
-	if ext.Config.Environment == nil {
-		env := make(map[string]string)
-		ext.Config.Environment = env
-	}
-	ext.Config.Environment["_SHIPYARD_EXTENSION"] = ext.ID
-	rp := citadel.RestartPolicy{
-		Name:              "on-failure",
-		MaximumRetryCount: 10,
-	}
-	image := &citadel.Image{
-		Name:          ext.Image,
-		ContainerName: ext.Config.ContainerName,
-		Cpus:          ext.Config.Cpus,
-		Memory:        ext.Config.Memory,
-		Environment:   ext.Config.Environment,
-		Links:         ext.Config.Links,
-		Args:          ext.Config.Args,
-		Volumes:       ext.Config.Volumes,
-		BindPorts:     ext.Config.Ports,
-		Labels:        []string{},
-		Type:          "service",
-		RestartPolicy: rp,
-	}
-	if ext.Config.DeployPerEngine {
-		engs := m.clusterManager.Engines()
-		extEngines := []*citadel.Engine{}
-		containers := m.Containers(true)
-		for _, c := range containers {
-			if v, ok := c.Image.Environment["_SHIPYARD_EXTENSION"]; ok {
-				if v == ext.ID {
-					extEngines = append(extEngines, c.Engine)
-				}
-			}
-		}
-		for _, eng := range engs {
-			// skip if already present
-			for _, xe := range extEngines {
-				if xe == eng {
-					continue
-				}
-			}
-			image.Type = "host"
-			labels := []string{fmt.Sprintf("host:%s", eng.ID)}
-			image.Labels = labels
-			container, err := m.clusterManager.Start(image, true)
-			if err != nil {
-				logger.Errorf("error running %s for extension image %s: %s", image.Name, ext.Name, err)
-				return err
-			}
-			logger.Infof("started %s (%s) for extension %s", container.ID[:8], image.Name, ext.Name)
-		}
-	} else {
-		container, err := m.clusterManager.Start(image, true)
-		if err != nil {
-			logger.Errorf("error running %s for extension image %s: %s", image.Name, ext.Name, err)
-			return err
-		}
-		logger.Infof("started %s (%s) for extension %s", container.ID[:8], image.Name, ext.Name)
-	}
-	logger.Infof("registered extension name=%s version=%s author=%s", ext.Name, ext.Version, ext.Author)
-	return nil
-}
-
-func (m *Manager) UnregisterExtension(ext *shipyard.Extension) error {
-	// remove containers that are linked to extension
-	containers := m.clusterManager.ListContainers(true, false, "")
-	for _, c := range containers {
-		// check if has the extension env var
-		if val, ok := c.Image.Environment["_SHIPYARD_EXTENSION"]; ok {
-			// check if the same parent extension
-			if val == ext.ID {
-				logger.Infof("terminating extension (%s) container %s", ext.Name, c.ID[:8])
-				if err := m.clusterManager.Kill(c, 9); err != nil {
-					logger.Warnf("error terminating extension (%s) container %s: %s", ext.Name, c.ID[:8], err)
-				}
-				if err := m.clusterManager.Remove(c); err != nil {
-					logger.Warnf("error removing extension (%s) container %s: %s", ext.Name, c.ID[:8], err)
-				}
-			}
-		}
-	}
-	logger.Infof("un-registered extension name=%s version=%s author=%s", ext.Name, ext.Version, ext.Author)
-	return nil
-}
-
-func (m *Manager) DeleteExtension(id string) error {
-	ext, err := m.Extension(id)
-	if err != nil {
-		return err
-	}
-	if err := m.UnregisterExtension(ext); err != nil {
-		return err
-	}
-	res, err := r.Table(tblNameExtensions).Get(id).Delete().Run(m.session)
-	if err != nil {
-		return err
-	}
-	if res.IsNil() {
-		return ErrExtensionDoesNotExist
-	}
-	return nil
-}
-
 func (m *Manager) RedeployContainers(image string) error {
-	var img *citadel.Image
-	containers := m.Containers(false)
+	var cfg *dockerclient.ContainerConfig
+	containers, err := m.Containers(false)
+	if err != nil {
+		return err
+	}
 	deployed := false
 	for _, c := range containers {
-		if strings.Index(c.Image.Name, image) > -1 {
-			img = c.Image
-			logger.Infof("pulling latest image for %s", image)
-			if err := c.Engine.Pull(image); err != nil {
+		if strings.Index(c.Image, image) > -1 {
+			info, err := m.client.InspectContainer(c.Id)
+			if err != nil {
 				return err
 			}
-			m.Destroy(c)
-			// in order to keep fast deploys, we must deploy
-			// to the same host that the image was running on previously
-			img.Type = "host"
-			lbl := fmt.Sprintf("host:%s", c.Engine.ID)
-			img.Labels = []string{lbl}
-			nc, err := m.ClusterManager().Start(img, false)
+			cfg = info.Config
+			logger.Infof("pulling latest image for %s", image)
+			if err := m.client.PullImage(image, nil); err != nil {
+				return err
+			}
+			m.Destroy(c.Id)
+
+			containerId, err := m.client.CreateContainer(cfg, "")
 			if err != nil {
+				return err
+			}
+
+			if err := m.client.StartContainer(containerId, info.HostConfig); err != nil {
 				return err
 			}
 			deployed = true
-			logger.Infof("deployed updated container %s via webhook for %s", nc.ID[:8], image)
+			logger.Infof("deployed updated container %s via webhook for %s", containerId[:8], image)
 		}
 	}
 	if deployed {
 		evt := &shipyard.Event{
 			Type:    "deploy",
 			Message: fmt.Sprintf("%s deployed", image),
-			Time:    time.Now(),
+			Time:    time.Now().Unix(),
 			Tags:    []string{"deploy"},
 		}
 		if err := m.SaveEvent(evt); err != nil {
@@ -1030,7 +691,7 @@ func (m *Manager) SaveWebhookKey(key *dockerhub.WebhookKey) error {
 	}
 	evt := &shipyard.Event{
 		Type:    "add-webhook-key",
-		Time:    time.Now(),
+		Time:    time.Now().Unix(),
 		Message: fmt.Sprintf("image=%s", key.Image),
 		Tags:    []string{"docker", "webhook"},
 	}
@@ -1054,7 +715,7 @@ func (m *Manager) DeleteWebhookKey(id string) error {
 	}
 	evt := &shipyard.Event{
 		Type:    "delete-webhook-key",
-		Time:    time.Now(),
+		Time:    time.Now().Unix(),
 		Message: fmt.Sprintf("image=%s key=%s", key.Image, key.Key),
 		Tags:    []string{"docker", "webhook"},
 	}
@@ -1064,19 +725,30 @@ func (m *Manager) DeleteWebhookKey(id string) error {
 	return nil
 }
 
-func (m *Manager) Run(image *citadel.Image, count int, pull bool) ([]*citadel.Container, error) {
-	launched := []*citadel.Container{}
+func (m *Manager) Run(config *dockerclient.ContainerConfig, count int, pull bool) ([]string, error) {
+	launched := []string{}
 
 	var wg sync.WaitGroup
 	wg.Add(count)
 	var runErr error
 	for i := 0; i < count; i++ {
 		go func(wg *sync.WaitGroup) {
-			container, err := m.ClusterManager().Start(image, pull)
+			if pull {
+				if err := m.client.PullImage(config.Image, nil); err != nil {
+					runErr = err
+					return
+				}
+			}
+			containerId, err := m.client.CreateContainer(config, "")
 			if err != nil {
 				runErr = err
+				return
 			}
-			launched = append(launched, container)
+			if err := m.client.StartContainer(containerId, &config.HostConfig); err != nil {
+				runErr = err
+				return
+			}
+			launched = append(launched, containerId)
 			wg.Done()
 		}(&wg)
 	}
@@ -1084,8 +756,12 @@ func (m *Manager) Run(image *citadel.Image, count int, pull bool) ([]*citadel.Co
 	return launched, runErr
 }
 
-func (m *Manager) Scale(container *citadel.Container, count int) error {
-	imageContainers, err := m.IdenticalContainers(container, true)
+func (m *Manager) Scale(container *dockerclient.ContainerInfo, count int) error {
+	info, err := m.client.InspectContainer(container.Id)
+	if err != nil {
+		return err
+	}
+	imageContainers, err := m.IdenticalContainers(info, true)
 	if err != nil {
 		return err
 	}
@@ -1095,30 +771,15 @@ func (m *Manager) Scale(container *citadel.Container, count int) error {
 		numKill := containerCount - count
 		delContainers := imageContainers[0:numKill]
 		for _, c := range delContainers {
-			if err := m.Destroy(c); err != nil {
+			if err := m.Destroy(c.Id); err != nil {
 				return err
 			}
 		}
 	} else if containerCount < count { // up
 		numAdd := count - containerCount
-		// check for vols or links -- if so, launch on same engine
-		img := container.Image
-		if len(img.Volumes) > 0 || len(img.Links) > 0 {
-			eng := container.Engine
-			t := fmt.Sprintf("host:%s", eng.ID)
-			lbls := img.Labels
-			lbls = append(lbls, t)
-			img.Type = "host"
-			img.Labels = lbls
-		}
-		// bindports must be updated to remove the hostport as they
-		// will fail to start
-		for _, p := range img.BindPorts {
-			p.Port = 0
-		}
 		// reset hostname
-		img.Hostname = ""
-		if _, err := m.Run(img, numAdd, false); err != nil {
+		container.Config.Hostname = ""
+		if _, err := m.Run(container.Config, numAdd, false); err != nil {
 			return err
 		}
 	} else { // none

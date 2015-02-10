@@ -5,14 +5,9 @@
         .module('shipyard.containers')
         .controller('DeployController', DeployController);
 
-    DeployController.$inject = ['$scope', '$location', 'Engines', 'Container'];
+    DeployController.$inject = ['$scope', '$location', 'Container'];
 
-    function DeployController($scope, $location, Engines, Container) {
-        var types = [
-            "service",
-            //"engine", // removed until we get the UI to show engines to select
-            "unique"
-        ];
+    function DeployController($scope, $location, Container) {
         var networkModes = [
             "bridge",
             "none",
@@ -37,7 +32,6 @@
         $scope.links = null;
         $scope.volumes = null;
         $scope.pull = true;
-        $scope.types = types;
         $scope.selectType = function(type) {
             $scope.selectedType = type;
             $(".ui.dropdown").dropdown('hide');
@@ -64,17 +58,6 @@
             }
             $(".ui.dropdown").dropdown('hide');
         }
-        var labels = [];
-        Engines.query(function(engines){
-            angular.forEach(engines, function(e) {
-                angular.forEach(e.engine.labels, function(l){
-                    if (labels.indexOf(l) == -1) {
-                        this.push(l);
-                    }
-                }, labels);
-            });
-            $scope.labels = labels;
-        });
         $scope.addPortDefinition = addPortDefinition;
         $scope.showLoader = function() {
             $(".ui.loader").removeClass("disabled");

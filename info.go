@@ -2,13 +2,10 @@ package shipyard
 
 type (
 	ClusterInfo struct {
-		Cpus           float64 `json:"cpus,omitempty"`
-		Memory         float64 `json:"memory,omitempty"`
-		ContainerCount int     `json:"container_count,omitempty"`
-		EngineCount    int     `json:"engine_count,omitempty"`
-		ImageCount     int     `json:"image_count,omitempty"`
-		ReservedCpus   float64 `json:"reserved_cpus,omitempty"`
-		ReservedMemory float64 `json:"reserved_memory,omitempty"`
-		Version        string  `json:"version,omitempty"`
+		Cpus           int64  `json:"cpus,omitempty"`
+		Memory         int64  `json:"memory,omitempty"`
+		ContainerCount int64  `json:"container_count,omitempty"`
+		ImageCount     int64  `json:"image_count,omitempty"`
+		Version        string `json:"version,omitempty"`
 	}
 )

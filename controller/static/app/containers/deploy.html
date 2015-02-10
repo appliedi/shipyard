@@ -100,17 +100,6 @@
             </div>
             <div class="three fields">
                 <div class="field">
-                    <label>Type</label>
-                    <div class="ui left labeled selection dropdown">
-                        <input type="hidden" name="type" ng-model="type" value="{{selectedType}}">
-                        <div class="default text">{{selectedType || 'Type'}}</div>
-                        <i class="dropdown icon"></i>
-                        <div class="menu">
-                            <div class="item" ng-repeat="t in types" data-value="{{t}}" ng-click="selectType(t)">{{t}}</div>
-                        </div>
-                    </div>
-                </div>
-                <div class="field">
                     <label>Restart Policy</label>
                     <div class="ui left labeled selection dropdown">
                         <input type="hidden" name="restartPolicy" ng-model="selectedRestartPolicy" value="{{selectedRestartPolicy}}">
@@ -149,10 +138,6 @@
                         </div>
                     </div>
                 </div>
-            </div>
-            <div class="field">
-                <label>Labels</label>
-                <checkbox checked="false" name="labels" value="{{label}}" ng-model="selectedLabels" class="engine-label" ng-repeat="label in labels">{{label}}</checkbox>
             </div>
             <!--
             <div class="field">

@@ -1,20 +1,23 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/citadel/citadel"
 	"github.com/codegangsta/negroni"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gorilla/context"
 	"github.com/gorilla/mux"
+	"github.com/samalba/dockerclient"
 	"github.com/shipyard/shipyard"
 	"github.com/shipyard/shipyard/controller/manager"
 	"github.com/shipyard/shipyard/controller/middleware/access"
@@ -27,6 +30,12 @@ var (
 	rethinkdbAddr     string
 	rethinkdbDatabase string
 	rethinkdbAuthKey  string
+	swarmUrl          string
+	swarmTlsCaCert    string
+	swarmTlsCert      string
+	swarmTlsKey       string
+	allowInsecureTls  bool
+
 	disableUsageInfo  bool
 	showVersion       bool
 	controllerManager *manager.Manager
@@ -50,6 +59,11 @@ func init() {
 	flag.StringVar(&rethinkdbAddr, "rethinkdb-addr", "127.0.0.1:28015", "rethinkdb address")
 	flag.StringVar(&rethinkdbDatabase, "rethinkdb-database", "shipyard", "rethinkdb database")
 	flag.StringVar(&rethinkdbAuthKey, "rethinkdb-auth-key", "", "rethinkdb auth key")
+	flag.StringVar(&swarmUrl, "swarm-url", "tcp://127.0.0.1:2375", "swarm url")
+	flag.StringVar(&swarmTlsCaCert, "swarm-tls-ca-cert", "", "path to TLS CA cert")
+	flag.StringVar(&swarmTlsCert, "swarm-tls-cert", "", "path to TLS cert")
+	flag.StringVar(&swarmTlsKey, "swarm-tls-key", "", "path to TLS key")
+	flag.BoolVar(&allowInsecureTls, "allow-insecure-tls", false, "allow insecure tls")
 	flag.BoolVar(&disableUsageInfo, "disable-usage-info", false, "disable anonymous usage info")
 	flag.BoolVar(&showVersion, "version", false, "show version and exit")
 }
@@ -67,13 +81,13 @@ func destroy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := controllerManager.Destroy(container); err != nil {
-		logger.Errorf("error destroying %s: %s", container.ID, err)
+	if err := controllerManager.Destroy(container.Id); err != nil {
+		logger.Errorf("error destroying %s: %s", container.Id, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	logger.Infof("destroyed container %s (%s)", container.ID, container.Image.Name)
+	logger.Infof("destroyed container %s (%s)", container.Id, container.Config.Image)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -100,14 +114,14 @@ func run(w http.ResponseWriter, r *http.Request) {
 		}
 		count = cc
 	}
-	var image *citadel.Image
-	if err := json.NewDecoder(r.Body).Decode(&image); err != nil {
+	var config *dockerclient.ContainerConfig
+	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
 		logger.Warnf("error decoding image: %s", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	launched, err := controllerManager.Run(image, count, pull)
+	launched, err := controllerManager.Run(config, count, pull)
 	if err != nil {
 		logger.Warnf("error running container: %s", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -135,13 +149,13 @@ func stopContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := controllerManager.ClusterManager().Stop(container); err != nil {
-		logger.Errorf("error stopping %s: %s", container.ID, err)
+	if err := controllerManager.Stop(container.Id); err != nil {
+		logger.Errorf("error stopping %s: %s", container.Id, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	logger.Infof("stopped container %s (%s)", container.ID, container.Image.Name)
+	logger.Infof("stopped container %s (%s)", container.Id, container.Config.Image)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -159,9 +173,17 @@ func containerLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := controllerManager.ClusterManager().Logs(container, true, true)
+	logOptions := &dockerclient.LogOptions{
+		Follow:     false,
+		Stdout:     true,
+		Stderr:     true,
+		Tail:       0,
+		Timestamps: true,
+	}
+
+	data, err := controllerManager.Logs(container.Id, logOptions)
 	if err != nil {
-		logger.Errorf("error getting logs for %s: %s", container.ID, err)
+		logger.Errorf("error getting logs for %s: %s", container.Id, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -182,13 +204,13 @@ func restartContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := controllerManager.ClusterManager().Restart(container, 10); err != nil {
-		logger.Errorf("error restarting %s: %s", container.ID, err)
+	if err := controllerManager.Restart(container.Id); err != nil {
+		logger.Errorf("error restarting %s: %s", container.Id, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	logger.Infof("restarted container %s (%s)", container.ID, container.Image.Name)
+	logger.Infof("restarted container %s (%s)", container.Id, container.Config.Image)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -222,37 +244,18 @@ func scaleContainer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	logger.Infof("scaled container %s (%s) to %d", container.ID, container.Image.Name, count)
+	logger.Infof("scaled container %s (%s) to %d", container.Id, container.Config.Image, count)
 
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func engines(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("content-type", "application/json")
-
-	engines := controllerManager.Engines()
-	if err := json.NewEncoder(w).Encode(engines); err != nil {
-		logger.Error(err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-}
-
-func inspectEngine(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("content-type", "application/json")
-
-	vars := mux.Vars(r)
-	id := vars["id"]
-	engine := controllerManager.Engine(id)
-	if err := json.NewEncoder(w).Encode(engine); err != nil {
-		logger.Error(err)
-	}
 }
 
 func containers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("content-type", "application/json")
 
-	containers := controllerManager.Containers(true)
+	containers, err := controllerManager.Containers(true)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 	if err := json.NewEncoder(w).Encode(containers); err != nil {
 		logger.Error(err)
 	}
@@ -277,41 +280,16 @@ func inspectContainer(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func addEngine(w http.ResponseWriter, r *http.Request) {
-	var engine *shipyard.Engine
-	if err := json.NewDecoder(r.Body).Decode(&engine); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	health := &shipyard.Health{
-		Status:       "pending",
-		ResponseTime: 0,
-	}
-	engine.Health = health
-	if err := controllerManager.AddEngine(engine); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	logger.Infof("added engine id=%s addr=%s cpus=%f memory=%f", engine.Engine.ID, engine.Engine.Addr, engine.Engine.Cpus, engine.Engine.Memory)
-	w.WriteHeader(http.StatusCreated)
-}
-
-func removeEngine(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id := vars["id"]
-	engine := controllerManager.Engine(id)
-	if err := controllerManager.RemoveEngine(engine.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	logger.Infof("removed engine id=%s", engine.Engine.ID)
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func clusterInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("content-type", "application/json")
 
-	info := controllerManager.ClusterInfo()
+	info, err := controllerManager.ClusterInfo()
+	if err != nil {
+
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	if err := json.NewEncoder(w).Encode(info); err != nil {
 		logger.Error(err)
 	}
@@ -512,65 +490,6 @@ func deleteRole(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func extensions(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("content-type", "application/json")
-
-	exts, err := controllerManager.Extensions()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := json.NewEncoder(w).Encode(exts); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-func extension(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("content-type", "application/json")
-
-	vars := mux.Vars(r)
-	id := vars["id"]
-	ext, err := controllerManager.Extension(id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := json.NewEncoder(w).Encode(ext); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-func addExtension(w http.ResponseWriter, r *http.Request) {
-	var ext *shipyard.Extension
-	if err := json.NewDecoder(r.Body).Decode(&ext); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if err := controllerManager.SaveExtension(ext); err != nil {
-		logger.Errorf("error saving extension: %s", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	logger.Infof("saved extension name=%s version=%s author=%s", ext.Name, ext.Version, ext.Author)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func deleteExtension(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	id := vars["id"]
-	if err := controllerManager.DeleteExtension(id); err != nil {
-		logger.Errorf("error deleting extension: %s", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	logger.Infof("removed extension %s", id)
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func webhookKeys(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("content-type", "application/json")
 
@@ -701,6 +620,41 @@ func hubWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func getTLSConfig(caCert, cert, key []byte, allowInsecure bool) (*tls.Config, error) {
+	// TLS config
+	var tlsConfig tls.Config
+	tlsConfig.InsecureSkipVerify = true
+	certPool := x509.NewCertPool()
+
+	if _, err := os.Stat("rootcerts.crt"); err != nil {
+		rootCerts, err := ioutil.ReadFile("rootcerts.crt")
+		if err != nil {
+			return nil, err
+		}
+
+		if ok := certPool.AppendCertsFromPEM(rootCerts); !ok {
+			return nil, fmt.Errorf("unable to add root certificates")
+		}
+	}
+
+	if ok := certPool.AppendCertsFromPEM(caCert); !ok {
+		return nil, fmt.Errorf("unable to add ca certificate")
+	}
+
+	tlsConfig.RootCAs = certPool
+	keypair, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		return &tlsConfig, err
+	}
+
+	tlsConfig.Certificates = []tls.Certificate{keypair}
+	if allowInsecure {
+		tlsConfig.InsecureSkipVerify = true
+	}
+
+	return &tlsConfig, nil
+}
+
 func main() {
 	rHost := os.Getenv("RETHINKDB_PORT_28015_TCP_ADDR")
 	rPort := os.Getenv("RETHINKDB_PORT_28015_TCP_PORT")
@@ -727,7 +681,34 @@ func main() {
 
 	logger.Infof("shipyard version %s", VERSION)
 
-	controllerManager, mErr = manager.NewManager(rethinkdbAddr, rethinkdbDatabase, rethinkdbAuthKey, VERSION, disableUsageInfo)
+	// load tlsconfig
+	var tlsConfig *tls.Config
+	if swarmTlsCaCert != "" && swarmTlsCert != "" && swarmTlsKey != "" {
+		logger.Infof("using tls for communication with swarm")
+		caCert, err := ioutil.ReadFile(swarmTlsCaCert)
+		if err != nil {
+			logger.Fatalf("error loading ca cert: %s", err)
+		}
+
+		cert, err := ioutil.ReadFile(swarmTlsCert)
+		if err != nil {
+			logger.Fatalf("error loading cert: %s", err)
+		}
+
+		key, err := ioutil.ReadFile(swarmTlsKey)
+		if err != nil {
+			logger.Fatalf("error loading swarm key: %s", err)
+		}
+
+		cfg, err := getTLSConfig(caCert, cert, key, allowInsecureTls)
+		if err != nil {
+			logger.Fatalf("error configuring tls: %s", err)
+		}
+		tlsConfig = cfg
+
+	}
+
+	controllerManager, mErr = manager.NewManager(rethinkdbAddr, rethinkdbDatabase, rethinkdbAuthKey, VERSION, swarmUrl, tlsConfig, disableUsageInfo)
 	if mErr != nil {
 		logger.Fatal(mErr)
 	}
@@ -751,14 +732,6 @@ func main() {
 	apiRouter.HandleFunc("/api/containers/{id}/logs", containerLogs).Methods("GET")
 	apiRouter.HandleFunc("/api/events", events).Methods("GET")
 	apiRouter.HandleFunc("/api/events", purgeEvents).Methods("DELETE")
-	apiRouter.HandleFunc("/api/engines", engines).Methods("GET")
-	apiRouter.HandleFunc("/api/engines", addEngine).Methods("POST")
-	apiRouter.HandleFunc("/api/engines/{id}", inspectEngine).Methods("GET")
-	apiRouter.HandleFunc("/api/engines/{id}", removeEngine).Methods("DELETE")
-	apiRouter.HandleFunc("/api/extensions", extensions).Methods("GET")
-	apiRouter.HandleFunc("/api/extensions/{id}", extension).Methods("GET")
-	apiRouter.HandleFunc("/api/extensions", addExtension).Methods("POST")
-	apiRouter.HandleFunc("/api/extensions/{id}", deleteExtension).Methods("DELETE")
 	apiRouter.HandleFunc("/api/servicekeys", serviceKeys).Methods("GET")
 	apiRouter.HandleFunc("/api/servicekeys", addServiceKey).Methods("POST")
 	apiRouter.HandleFunc("/api/servicekeys", removeServiceKey).Methods("DELETE")

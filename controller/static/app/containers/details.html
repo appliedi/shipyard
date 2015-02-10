@@ -1,7 +1,7 @@
 <div class="ui breadcrumb">
     <a href="/#/containers" class="section">containers</a>
     <div class="divider"> / </div>
-    <div class="active section">{{container.id | limitTo:12}}</div>
+    <div class="active section">{{container.Id | limitTo:12}}</div>
 </div>
 
 <div class="ui basic small modal removeContainer">
@@ -9,7 +9,7 @@
         Destroy Container
     </div>
     <div class="content">
-        Destroy {{container.image.name}} ({{container.id|truncate}})?
+        Destroy {{container.Image}} ({{container.Id|truncate}})?
     </div>
     <div class="actions">
         <div class="ui button small">Cancel</div>
@@ -22,7 +22,7 @@
         Stop Container
     </div>
     <div class="content">
-        Stop {{container.image.name}} ({{container.id|truncate}})?
+        Stop {{container.Image}} ({{container.Id|truncate}})?
     </div>
     <div class="actions">
         <div class="ui button small">Cancel</div>
@@ -35,7 +35,7 @@
         Restart Container
     </div>
     <div class="content">
-        Restart {{container.image.name}} ({{container.id|truncate}})?
+        Restart {{container.Image}} ({{container.Id|truncate}})?
     </div>
     <div class="actions">
         <div class="ui button small">Cancel</div>
@@ -95,7 +95,7 @@
     </a>
 </div>
 <div class="ui icon buttons toolbar">
-    <a href="/#/containers/{{container.id}}/logs" class="ui button mini black">
+    <a href="/#/containers/{{container.Id}}/logs" class="ui button mini black">
         <i class="text file outline icon"></i>
         Logs
     </a>
@@ -109,22 +109,17 @@
     <div class="ui column">
         <div class="ui section">
             <h3 class="ui header">Name</h3>
-            <div>{{container.name|container_name}}</div>
+            <div>{{container.Name|container_name}}</div>
         </div>
         <div class="ui divider"></div>
         <div>
             <h3 class="ui header">Image</h3>
-            <div>{{container.image.name}}</div>
-        </div>
-        <div class="ui divider"></div>
-        <div>
-            <h3 class="ui header">Type</h3>
-            <div>{{container.image.type}}</div>
+            <div>{{container.Config.Image}}</div>
         </div>
         <div class="ui divider"></div>
         <h4 class="ui top attached block header">Environment</h4>
-        <div class="ui segment attached" ng-hide="container.image.environment">No environment variables</div>
-        <div class="ui segment attached" ng-repeat="(k,v) in container.image.environment">
+        <div class="ui segment attached" ng-hide="container.Config.Env">No environment variables</div>
+        <div class="ui segment attached" ng-repeat="(k,v) in container.Config.Env">
             <strong>{{k}}</strong> <div class="ui mini button right floated" envvar="">Show</div>
             <div class="ui hide">{{v}}</div>
         </div>
@@ -132,38 +127,33 @@
     <div class="ui column">
         <div class="ui section">
             <h3 class="ui header">Hostname</h3>
-            <div>{{container.image.hostname}}</div>
-        </div>
-        <div class="ui divider"></div>
-        <div class="ui section">
-            <h3 class="ui header">Engine</h3>
-            <div>{{container.engine.id}}</div>
+            <div>{{container.Config.Hostname}}</div>
         </div>
         <div class="ui divider"></div>
         <div class="ui section">
             <h3 class="ui header">Network Mode</h3>
-            <div>{{container.image.network_mode}}</div>
+            <div>{{container.HostConfig.NetworkMode}}</div>
         </div>
         <div class="ui divider"></div>
         <div class="ui section">
             <h3 class="ui header">Restart Policy</h3>
             <div>
-                {{container.image.restart_policy.name || "no"}}<span ng-show="container.image.restart_policy.maximum_retry">:{{container.image.restart_policy.maximum_retry}}</span>
+                {{container.HostConfig.RestartPolicy.Name || "no"}}<span ng-show="container.HostConfig.RestartPolicy.MaximumRetry">:{{container.HostConfig.RestartPolicy.MaximumRetry}}</span>
             </div>
         </div>
         <div class="ui divider"></div>
         <div class="ui section">
             <h3 class="ui header">Privileged</h3>
             <div>
-                {{container.image.privileged}}
+                {{container.HostConfig.Privileged}}
             </div>
         </div>
         <div class="ui divider"></div>
         <h4 class="ui top attached block header">Ports</h4>
         <div class="ui segment attached">
-            <div ng-hide="container.ports">No exposed ports</div>
+            <div ng-hide="container.NetworkSettings.Ports">No exposed ports</div>
             <div ng-repeat="l in portLinks | orderBy:predicate">
-                <a href="{{l.link}}">{{l.protocol}}/{{l.container_port}} -> {{l.hostname}}:{{l.port}}</a>
+                <a href="{{l.link}}">{{l.link}}</a>
             </div>
         </div>
     </div>

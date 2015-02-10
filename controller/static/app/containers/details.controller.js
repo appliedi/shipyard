@@ -95,28 +95,22 @@
                     return "<div class='ui block small header'>Reserved</div>" + '<p>' + y + '</p>';
                 }
             };
-            angular.forEach(data.ports, function(p) {
-                var h = document.createElement('a');
-                h.href = data.engine.addr;
-                var l = {};
-                l.hostname = h.hostname;
-                l.protocol = p.proto;
-                l.port = p.port;
-                l.container_port = p.container_port;
-                l.link = h.protocol + '//' + h.hostname + ':' + p.port;
-                this.push(l);
+            angular.forEach(data.NetworkSettings.Ports, function(p) {
+              var l = {};
+              l.link =  'http://' + p[0].HostIp + ':' + p[0].HostPort;
+              this.push(l);
             }, portLinks);
             $scope.portLinks = portLinks;
             $scope.predicate = 'container_port';
-            $scope.cpuMax = data.engine.cpus;
-            $scope.memoryMax = data.engine.memory;
+            $scope.cpuMax = data.Config.CpuShares;
+            $scope.memoryMax = data.Config.Memory;
             $scope.chartOptions = {};
             $scope.containerCpuData = {
                 labels: ["Reserved"],
                 datasets: [
                 {
                     fillColor: "#6D91AD",
-                    data: [ $scope.container.image.cpus ]
+                    data: [ $scope.container.Config.CpuShares ]
                 }
                 ]
             };
@@ -125,7 +119,7 @@
                 datasets: [
                 {
                     fillColor: "#6D91AD",
-                    data: [ $scope.container.image.memory ]
+                    data: [ $scope.container.Config.Memory ]
                 }
                 ]
             };
